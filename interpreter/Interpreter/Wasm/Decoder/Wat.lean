@@ -949,6 +949,38 @@ private def stripQuotes (s : String) : String :=
     ((s.drop 1).dropEnd 1).toString
   else s
 
+private def hexDigitVal (c : Char) : Option Nat :=
+  if c.isDigit then some (c.toNat - '0'.toNat)
+  else if 'a' ≤ c && c ≤ 'f' then some (10 + c.toNat - 'a'.toNat)
+  else if 'A' ≤ c && c ≤ 'F' then some (10 + c.toNat - 'A'.toNat)
+  else none
+
+private partial def decodeWatBytes : List Char → Except Err (List UInt8)
+  | []                   => .ok []
+  | '\\' :: 'n'  :: r   => (0x0A :: ·) <$> decodeWatBytes r
+  | '\\' :: 't'  :: r   => (0x09 :: ·) <$> decodeWatBytes r
+  | '\\' :: 'r'  :: r   => (0x0D :: ·) <$> decodeWatBytes r
+  | '\\' :: '"'  :: r   => (0x22 :: ·) <$> decodeWatBytes r
+  | '\\' :: '\'' :: r   => (0x27 :: ·) <$> decodeWatBytes r
+  | '\\' :: '\\' :: r   => (0x5C :: ·) <$> decodeWatBytes r
+  | '\\' :: h1 :: h2 :: r =>
+    match hexDigitVal h1, hexDigitVal h2 with
+    | some d1, some d2 => (UInt8.ofNat (d1 * 16 + d2) :: ·) <$> decodeWatBytes r
+    | _, _ => .error s!"invalid hex escape \\{h1}{h2} in data string"
+  | '\\' :: c :: _ => .error s!"invalid escape '\\{c}' in data string"
+  | c :: r               => (c.toNat.toUInt8 :: ·) <$> decodeWatBytes r
+
+private def parseWatString (s : String) : Except Err (List UInt8) :=
+  if !s.startsWith "\"" then .error s!"expected string literal, got: {s}"
+  else decodeWatBytes (stripQuotes s).toList
+
+private def parseWatName (s : String) : Except Err String := do
+  let bytes ← parseWatString s
+  let ba : ByteArray := ⟨bytes.toArray⟩
+  match String.fromUTF8? ba with
+  | some str => .ok str
+  | none     => .error s!"export name is not valid UTF-8: {s}"
+
 private def parseFunc (funcIds : Std.HashMap String Nat)
     (globalIds : Std.HashMap String Nat)
     (types : Array TypeEntry) (xs : List Sexpr)
@@ -1047,7 +1079,7 @@ private def parseFunc (funcIds : Std.HashMap String Nat)
       | "export" =>
         match tail with
         | [.atom s] =>
-          inlineExports := inlineExports ++ [stripQuotes s]
+          inlineExports := inlineExports ++ [← parseWatName s]
         | _ => throw "malformed inline (export ...)"
         rest := r
       | "import" =>
@@ -1113,31 +1145,6 @@ private def collectGlobalNames (fields : List Sexpr)
       i := i + 1
     | _ => pure ()
   return idOf
-
-private def hexDigitVal (c : Char) : Option Nat :=
-  if c.isDigit then some (c.toNat - '0'.toNat)
-  else if 'a' ≤ c && c ≤ 'f' then some (10 + c.toNat - 'a'.toNat)
-  else if 'A' ≤ c && c ≤ 'F' then some (10 + c.toNat - 'A'.toNat)
-  else none
-
-private partial def decodeWatBytes : List Char → Except Err (List UInt8)
-  | []                   => .ok []
-  | '\\' :: 'n'  :: r   => (0x0A :: ·) <$> decodeWatBytes r
-  | '\\' :: 't'  :: r   => (0x09 :: ·) <$> decodeWatBytes r
-  | '\\' :: 'r'  :: r   => (0x0D :: ·) <$> decodeWatBytes r
-  | '\\' :: '"'  :: r   => (0x22 :: ·) <$> decodeWatBytes r
-  | '\\' :: '\'' :: r   => (0x27 :: ·) <$> decodeWatBytes r
-  | '\\' :: '\\' :: r   => (0x5C :: ·) <$> decodeWatBytes r
-  | '\\' :: h1 :: h2 :: r =>
-    match hexDigitVal h1, hexDigitVal h2 with
-    | some d1, some d2 => (UInt8.ofNat (d1 * 16 + d2) :: ·) <$> decodeWatBytes r
-    | _, _ => .error s!"invalid hex escape \\{h1}{h2} in data string"
-  | '\\' :: c :: _ => .error s!"invalid escape '\\{c}' in data string"
-  | c :: r               => (c.toNat.toUInt8 :: ·) <$> decodeWatBytes r
-
-private def parseWatString (s : String) : Except Err (List UInt8) :=
-  if !s.startsWith "\"" then .error s!"expected string literal, got: {s}"
-  else decodeWatBytes (stripQuotes s).toList
 
 private def parseGlobalDecl (xs : List Sexpr) : Except Err Wasm.GlobalDecl := do
   let xs := match xs with
@@ -1241,7 +1248,7 @@ def parseModule (xs : List Sexpr) : Except Err Wasm.Module := do
     | .list (.atom "export" :: tail) =>
       match tail with
       | [.atom name, .list [.atom "func", .atom ref]] =>
-        topExports := topExports.push (stripQuotes name, ref)
+        topExports := topExports.push (← parseWatName name, ref)
       | [.atom _, .list (.atom "func" :: _)] =>
         throw "malformed top-level (export … (func …))"
       | _ =>
